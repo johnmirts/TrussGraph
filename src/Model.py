@@ -201,8 +201,8 @@ class Graph():
     #-----------------------------------
     
     @AxialForces.setter
-    def AxialForces(self, list):
-        self._weights = list
+    def AxialForces(self, lst):
+        self._weights = lst
     
     #---------------------------------------------------
     #        P R I V A T E   M E T H O D S
@@ -762,12 +762,12 @@ class Vertex():
     #-----------------------------------
     
     @AdjacentNodes.setter
-    def AdjacentNodes(self, list):
-        self._adjNodes = list
+    def AdjacentNodes(self, lst):
+        self._adjNodes = lst
 
     @IncidentEdges.setter
-    def IncidentEdges(self, list):
-        self._incEdges = list
+    def IncidentEdges(self, lst):
+        self._incEdges = lst
 
     @Ux.setter
     def Ux(self, value):
