@@ -1,4 +1,5 @@
-#Graph.py
+import os
+import json
 import numpy as np
 import networkx as nx
 
@@ -16,7 +17,7 @@ class Graph():
         self._connectivity = self._set_connectivity(adj_list)
         
         if anchored_nodes==None:
-            self._nodal_labels = [-1 for _ in range(len(self._nodal_coordinates))] 
+            self._nodal_labels = [None for _ in range(len(self._nodal_coordinates))] 
         else:
             self._nodal_labels = [0 if i in anchored_nodes else 1 for i in range(len(self._nodal_coordinates))]
         self._vertices = self._set_coords(self._nodal_labels)
@@ -95,7 +96,7 @@ class Graph():
     @property
     def LoadObjs(self):
         return self._loads
-
+   
     @property
     def MaxCompressionForce(self):
         return min(self.AxialForces)
@@ -469,14 +470,32 @@ class Graph():
     #-------------------------------------------------
 
     @staticmethod
+    def ByJSONpath(file_path):
+        graphs = []
+
+        for fname in os.listdir(file_path):
+            if fname.lower().endswith(".json"):
+                json_path = os.path.join(file_path, fname)
+
+                with open(json_path, "r") as f:
+                    data = json.load(f)
+
+                    graphs.append(Graph.ByJSONstring(data))
+
+        return graphs
+
+    @staticmethod
     def ByJSONstring(data):
         # --- Node processing ---
         nodal_coordinates = []
+        fixed_nodes = []
         uxs = []
         uys = []
         uzs = []
         for node in data["nodes"]:
             nodal_coordinates.append([node["X"], node["Y"], node["Z"]])
+            if (node["is_free"] == 0):
+                fixed_nodes.append(node["node_id"])
             try:
                 uxs.append(node["Ux"])
                 uys.append(node["Uy"])
@@ -503,10 +522,10 @@ class Graph():
             load_vecs = []
             load_anc_ids = []
             load_labels = []
-            for load in data["loads"]:
+            for load in data["forces"]:
                 load_vecs.append([load["X"], load["Y"], load["Z"]])
                 load_anc_ids.append(load["anchor_id"])
-                load_labels.append(load["label"])
+                load_labels.append(load["is_load"])
 
             # Create the Graph instance
             graph = Graph(nodal_coordinates, adj_list, weights, load_components=load_vecs, anchored_nodes=load_anc_ids, load_labels=load_labels)
@@ -547,7 +566,7 @@ class Edge():
     #-----------------------------------
     #        G E T T E R S
     #-----------------------------------
-    
+
     @property
     def Id(self):
         return self._edge_id
@@ -757,6 +776,10 @@ class Vertex():
     def Uz(self):
         return self._uz
     
+    @property
+    def Valency(self):
+        return len(self.AdjacentNodes)
+
     #-----------------------------------
     #        S E T T E R S
     #-----------------------------------

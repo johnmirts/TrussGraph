@@ -32,6 +32,28 @@ class Utilities:
         sorted_result = dict(sorted(result.items(), key=lambda x: x[0]))
         return sorted_result
 
+    @staticmethod
+    def ScaleResults(graph, scale):
+        
+        # update applied loads + support reactions
+        for f in graph.LoadObjs:
+            f._X = f._X * scale
+            f._Y = f._Y * scale
+            f._Z = f._Z * scale
+
+        # update axial forces
+        for i,e in enumerate(graph.EdgeObjs):
+            e._weight = e._weight * scale
+            graph._weights[i] = e._weight
+
+        # update displacements
+        for v in graph.VertexObjs:
+            v._ux = v._ux * scale
+            v._uy = v._uy * scale
+            v._uz = v._uz * scale
+        
+        return graph
+
 class Vector():
     
     @staticmethod
