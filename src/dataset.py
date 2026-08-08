@@ -184,7 +184,7 @@ def json_to_pyg_data(
     return graph
 
 
-class TrussDataset(InMemoryDataset):
+class AxialForceDataset(InMemoryDataset):
     """PyTorch Geometric in-memory dataset."""
 
     def __init__(
