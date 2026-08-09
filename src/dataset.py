@@ -1,20 +1,47 @@
+"""Task-specific datasets for planar-truss graph learning."""
+
 from __future__ import annotations
 
 import hashlib
 import json
-import pickle
 import random
 import re
+import urllib.request
+import zipfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
 from torch_geometric.data import Data, InMemoryDataset
 
 
-_PANEL_SEED_RE = re.compile(r".*?(?:p|panels?)[_-]?(?P<panels>\d+).*?seed[_-]?(?P<seed>\d+)", re.IGNORECASE)
+ZENODO_RECORD_URL = "https://zenodo.org/records/18419272"
+ZENODO_FILE_URL = "https://zenodo.org/records/18419272/files/{file_name}?download=1"
+
+TYPOLOGY_FILES: Dict[str, str] = {
+    "Fink": "Fink.zip",
+    "Howe": "Howe.zip",
+    "KTruss": "KTruss.zip",
+    "Pratt": "Pratt.zip",
+    "Warren": "Warren.zip",
+}
+
+_TYPOLOGY_ALIASES = {
+    "fink": "Fink",
+    "howe": "Howe",
+    "ktruss": "KTruss",
+    "k_truss": "KTruss",
+    "k-truss": "KTruss",
+    "pratt": "Pratt",
+    "warren": "Warren",
+}
+_PANEL_SEED_RE = re.compile(
+    r".*?(?:p|panels?)[_-]?(?P<panels>\d+).*?seed[_-]?(?P<seed>\d+)",
+    re.IGNORECASE,
+)
+_PLANE_AXES = {"xy": (0, 1), "xz": (0, 2), "yz": (1, 2)}
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -24,206 +51,309 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
-def _parse_panels_seed(path: Path, payload: dict) -> Tuple[int, int]:
-    panels = int(payload.get("panels", -1))
-    seed = int(payload.get("seed", -1))
-    match = _PANEL_SEED_RE.match(path.parent.name)
-    if match:
-        if panels < 0:
-            panels = int(match.group("panels"))
-        if seed < 0:
-            seed = int(match.group("seed"))
-    return panels, seed
+def _canonical_typology(name: str) -> str:
+    normalized = str(name).strip()
+    key = normalized.lower().replace(" ", "").replace("-", "_")
+    if key in _TYPOLOGY_ALIASES:
+        return _TYPOLOGY_ALIASES[key]
+    if normalized in TYPOLOGY_FILES:
+        return normalized
+    raise ValueError(
+        f"Unknown typology {name!r}. Expected one of {sorted(TYPOLOGY_FILES)}."
+    )
+
+
+def _positive_or_none(value: Optional[int], name: str) -> Optional[int]:
+    if value is None:
+        return None
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive or None")
+    return value
+
+
+def _stable_seed(*parts: object) -> int:
+    digest = hashlib.sha1("|".join(map(str, parts)).encode("utf-8")).hexdigest()
+    return int(digest[:16], 16)
+
+
+def _natural_path_key(path: Path) -> tuple:
+    parts = re.split(r"(\d+)", str(path))
+    return tuple(int(part) if part.isdigit() else part.lower() for part in parts)
+
+
+def _sample_deterministically(values: Sequence, limit: Optional[int], seed: int) -> list:
+    values = list(values)
+    if limit is None or len(values) <= limit:
+        return values
+    rng = random.Random(seed)
+    return sorted(rng.sample(values, limit), key=lambda value: str(value))
 
 
 def _static_action(axial_force: Tensor, member_length: Tensor) -> Tensor:
-    """Static action measure: sum_e |N_e| L_e."""
     return (axial_force.abs() * member_length).sum()
 
 
-def json_to_pyg_data(
-    json_path: str | Path,
-    raw_root: str | Path,
-    typology_to_id: Dict[str, int],
-    group_to_id: Dict[str, int],
-) -> Data:
-    """Convert one truss JSON file to a PyG ``Data`` object.
+def _safe_extract(archive: zipfile.ZipFile, destination: Path) -> None:
+    destination = destination.resolve()
+    for member in archive.infolist():
+        target = (destination / member.filename).resolve()
+        if destination != target and destination not in target.parents:
+            raise RuntimeError(f"Unsafe path in zip archive: {member.filename}")
+    archive.extractall(destination)
 
-    Node features
-    -------------
-    [x/span, z/span, applied_fx/load_scale, applied_fz/load_scale,
-     support_flag, normalized_degree]
 
-    Directed message-passing edge features
-    ---------------------------------------
-    [dx/span, dz/span, length/span]
+def _download_typology(raw_root: Path, typology: str) -> None:
+    file_name = TYPOLOGY_FILES[typology]
+    url = ZENODO_FILE_URL.format(file_name=file_name)
+    download_dir = raw_root / "_downloads"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = download_dir / file_name
 
-    Original-member features used by the edge decoder
-    -------------------------------------------------
-    [length/span, |cos(theta)|, |sin(theta)|]
-    """
-    json_path = Path(json_path)
-    raw_root = Path(raw_root)
-    with json_path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    if not zip_path.exists():
+        print(f"Downloading {typology} from {url}")
+        try:
+            urllib.request.urlretrieve(url, zip_path)
+        except Exception as exc:  # pragma: no cover - network dependent.
+            raise RuntimeError(
+                f"Could not download {typology} from {url}. "
+                f"Download it manually from {ZENODO_RECORD_URL} and unzip it "
+                f"under {raw_root}."
+            ) from exc
 
-    raw_nodes = sorted(payload["nodes"], key=lambda n: int(n["node_id"]))
-    raw_edges = sorted(payload["edges"], key=lambda e: int(e["edge_id"]))
-    node_id_to_idx = {int(node["node_id"]): idx for idx, node in enumerate(raw_nodes)}
+    with zipfile.ZipFile(zip_path) as archive:
+        file_names = [
+            name for name in archive.namelist() if name and not name.endswith("/")
+        ]
+        top_levels = {Path(name).parts[0] for name in file_names if Path(name).parts}
+        if typology in top_levels:
+            _safe_extract(archive, raw_root)
+        else:
+            target_dir = raw_root / typology
+            target_dir.mkdir(parents=True, exist_ok=True)
+            _safe_extract(archive, target_dir)
 
-    pos_raw = torch.tensor(
-        [[_safe_float(node.get("X")), _safe_float(node.get("Z"))] for node in raw_nodes],
+    if not (raw_root / typology).is_dir():
+        raise RuntimeError(
+            f"Downloaded {file_name}, but could not find extracted folder "
+            f"{raw_root / typology}."
+        )
+
+
+def _select_json_paths(
+    raw_root: Path,
+    *,
+    typologies: Optional[Sequence[str]],
+    panels: Optional[Sequence[int]],
+    max_seeds_per_panel: Optional[int],
+    max_designs_per_seed: Optional[int],
+    sampling_seed: int,
+) -> List[Tuple[Path, str, int, int]]:
+    typology_dirs = [
+        path
+        for path in raw_root.iterdir()
+        if path.is_dir() and path.name != "_downloads" and path.name in TYPOLOGY_FILES
+    ]
+    if typologies is not None:
+        wanted = set(typologies)
+        typology_dirs = [
+            path for path in typology_dirs if _canonical_typology(path.name) in wanted
+        ]
+
+    seed_groups: Dict[Tuple[str, int], List[Tuple[Path, int]]] = defaultdict(list)
+    for typology_dir in sorted(typology_dirs, key=lambda path: path.name):
+        typology = _canonical_typology(typology_dir.name)
+        for directory in typology_dir.rglob("*"):
+            if not directory.is_dir():
+                continue
+            match = _PANEL_SEED_RE.fullmatch(directory.name)
+            if match is None:
+                continue
+            panel_count = int(match.group("panels"))
+            seed = int(match.group("seed"))
+            if panels is not None and panel_count not in panels:
+                continue
+            seed_groups[(typology, panel_count)].append((directory, seed))
+
+    selected: List[Tuple[Path, str, int, int]] = []
+    for (typology, panel_count), seed_dirs in sorted(seed_groups.items()):
+        seed_dirs = sorted(seed_dirs, key=lambda item: (item[1], item[0].name))
+        seed_dirs = _sample_deterministically(
+            seed_dirs,
+            max_seeds_per_panel,
+            seed=_stable_seed(sampling_seed, typology, panel_count, "seeds"),
+        )
+        for seed_dir, seed in seed_dirs:
+            files = sorted(seed_dir.glob("*.json"), key=_natural_path_key)
+            files = _sample_deterministically(
+                files,
+                max_designs_per_seed,
+                seed=_stable_seed(sampling_seed, typology, panel_count, seed, "designs"),
+            )
+            selected.extend((path, typology, panel_count, seed) for path in files)
+
+    return sorted(selected, key=lambda item: _natural_path_key(item[0]))
+
+
+def _parse_common_graph(raw: dict, plane: str) -> dict[str, Tensor | int]:
+    axes = _PLANE_AXES[plane]
+    nodes = sorted(raw["nodes"], key=lambda node: int(node["node_id"]))
+    edges = sorted(raw["edges"], key=lambda edge: int(edge.get("edge_id", 0)))
+    if not nodes:
+        raise ValueError("Graph contains no nodes")
+
+    node_id_to_index = {int(node["node_id"]): idx for idx, node in enumerate(nodes)}
+    coordinates_3d = torch.tensor(
+        [[_safe_float(node.get(axis)) for axis in ("X", "Y", "Z")] for node in nodes],
         dtype=torch.float32,
     )
-    mins = pos_raw.min(dim=0).values
-    maxs = pos_raw.max(dim=0).values
-    center = 0.5 * (mins + maxs)
-    span = (maxs - mins).max().clamp_min(1e-8)
-    pos = (pos_raw - center) / span
+    displacement_3d = torch.tensor(
+        [[_safe_float(node.get(axis)) for axis in ("Ux", "Uy", "Uz")] for node in nodes],
+        dtype=torch.float32,
+    )
+    coordinates = coordinates_3d[:, list(axes)]
+    displacement = displacement_3d[:, list(axes)]
 
-    # Only external applied loads are inputs. Reactions (is_load == 0) are excluded.
-    applied_load = torch.zeros((len(raw_nodes), 2), dtype=torch.float32)
-    for force in payload.get("forces", []):
+    applied_load = torch.zeros((len(nodes), 2), dtype=torch.float32)
+    for force in raw.get("forces", []):
         if int(force.get("is_load", 0)) != 1:
             continue
         anchor_id = int(force["anchor_id"])
-        if anchor_id not in node_id_to_idx:
+        if anchor_id not in node_id_to_index:
             continue
-        idx = node_id_to_idx[anchor_id]
-        applied_load[idx, 0] += _safe_float(force.get("X"))
-        applied_load[idx, 1] += _safe_float(force.get("Z"))
+        vector_3d = torch.tensor(
+            [_safe_float(force.get(axis)) for axis in ("X", "Y", "Z")],
+            dtype=torch.float32,
+        )
+        applied_load[node_id_to_index[anchor_id]] += vector_3d[list(axes)]
 
-    # Sum of applied load-vector magnitudes. Axial forces are normalized by the
-    # same quantity so the network learns a load-scale-independent response.
-    load_scale = applied_load.norm(dim=-1).sum().clamp_min(1e-8)
-    applied_load_norm = applied_load / load_scale
-
-    support_flag = torch.tensor(
-        [[1.0 - _safe_float(node.get("is_free", 1.0))] for node in raw_nodes],
+    free_mask = torch.tensor(
+        [bool(int(node.get("is_free", 1))) for node in nodes],
+        dtype=torch.bool,
+    )
+    valency_from_json = torch.tensor(
+        [_safe_float(node.get("valency")) for node in nodes],
         dtype=torch.float32,
     )
-    degree = torch.tensor(
-        [[_safe_float(node.get("valency", 0.0))] for node in raw_nodes],
-        dtype=torch.float32,
-    )
-    degree = degree / degree.max().clamp_min(1.0)
-
-    x = torch.cat([pos, applied_load_norm, support_flag, degree], dim=-1)
 
     starts: List[int] = []
     ends: List[int] = []
     lengths: List[float] = []
-    axial: List[float] = []
-    directed_attr_forward: List[List[float]] = []
-    member_attr: List[List[float]] = []
-
-    for edge in raw_edges:
-        start = node_id_to_idx[int(edge["start_id"])]
-        end = node_id_to_idx[int(edge["end_id"])]
-        delta_raw = pos_raw[end] - pos_raw[start]
-        computed_length = float(delta_raw.norm().item())
-        length = _safe_float(edge.get("length"), computed_length)
-        length = max(length, 1e-8)
-        delta_norm = delta_raw / span
-        length_norm = length / float(span.item())
-        direction = delta_raw / length
-
+    axial_forces: List[float] = []
+    degree = torch.zeros(len(nodes), dtype=torch.float32)
+    for edge in edges:
+        start = node_id_to_index[int(edge["start_id"])]
+        end = node_id_to_index[int(edge["end_id"])]
+        if start == end:
+            raise ValueError("Self-loop found in physical truss member")
+        delta = coordinates[end] - coordinates[start]
+        length = max(_safe_float(edge.get("length"), float(delta.norm())), 1e-8)
         starts.append(start)
         ends.append(end)
         lengths.append(length)
-        axial.append(_safe_float(edge.get("axial_f")))
-        directed_attr_forward.append(
-            [float(delta_norm[0]), float(delta_norm[1]), float(length_norm)]
-        )
-        member_attr.append([
-            length_norm,
-            float(direction[0])**2,
-            float(direction[1])**2,
-            float(direction[0]) * float(direction[1]) #cos_theta * sin_theta
-        ])
+        axial_forces.append(_safe_float(edge.get("axial_f")))
+        degree[start] += 1.0
+        degree[end] += 1.0
 
-    member_index = torch.tensor([starts, ends], dtype=torch.long)
-    forward_attr = torch.tensor(directed_attr_forward, dtype=torch.float32)
-    reverse_attr = forward_attr.clone()
-    reverse_attr[:, :2] *= -1.0
+    valency = torch.where(valency_from_json > 0, valency_from_json, degree)
+    return {
+        "coordinates": coordinates,
+        "displacement": displacement,
+        "applied_load": applied_load,
+        "free_mask": free_mask,
+        "valency": valency,
+        "member_index": torch.tensor([starts, ends], dtype=torch.long),
+        "member_length": torch.tensor(lengths, dtype=torch.float32),
+        "axial_force": torch.tensor(axial_forces, dtype=torch.float32),
+        "graph_id": int(raw.get("graph_id", -1)),
+        "num_members": len(edges),
+    }
 
-    # Duplicate members in both directions only for message passing. Predictions
-    # are made once per physical member through ``member_index``.
-    edge_index = torch.cat([member_index, member_index.flip(0)], dim=1)
-    edge_attr = torch.cat([forward_attr, reverse_attr], dim=0)
 
-    member_length = torch.tensor(lengths, dtype=torch.float32)
-    axial_force = torch.tensor(axial, dtype=torch.float32)
-    y = axial_force / load_scale
+def _normalize_coordinates(coordinates: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    coord_min = coordinates.min(dim=0).values
+    coord_max = coordinates.max(dim=0).values
+    center = 0.5 * (coord_min + coord_max)
+    length_scale = (coord_max - coord_min).max().clamp_min(1e-8)
+    return (coordinates - center) / length_scale, length_scale, center
 
-    relative = json_path.relative_to(raw_root)
-    typology = relative.parts[0] if len(relative.parts) > 1 else "unknown"
-    panels, seed = _parse_panels_seed(json_path, payload)
-    group_key = f"{typology}/panels_{panels}/seed_{seed}"
 
-    graph = Data(
-        x=x,
-        pos=pos,
-        pos_raw=pos_raw,
-        edge_index=edge_index,
-        edge_attr=edge_attr,
-        member_index=member_index,
-        member_attr=torch.tensor(member_attr, dtype=torch.float32),
-        member_length=member_length,
-        y=y,
-        axial_force=axial_force,
-        load_scale=load_scale.view(1),
-        static_action=_static_action(axial_force, member_length).view(1),
-        typology_id=torch.tensor([typology_to_id[typology]], dtype=torch.long),
-        group_id=torch.tensor([group_to_id[group_key]], dtype=torch.long),
-        panels=torch.tensor([panels], dtype=torch.long),
-        seed=torch.tensor([seed], dtype=torch.long),
-        graph_id=torch.tensor([int(payload.get("graph_id", -1))], dtype=torch.long),
-        num_members=torch.tensor([len(raw_edges)], dtype=torch.long),
+def _node_inputs(common: dict[str, Tensor | int]) -> tuple[Tensor, Tensor, Tensor]:
+    coordinates = common["coordinates"]
+    applied_load = common["applied_load"]
+    free_mask = common["free_mask"]
+    valency = common["valency"]
+    coordinates_norm, length_scale, _ = _normalize_coordinates(coordinates)
+    load_scale = applied_load.norm(dim=-1).sum().clamp_min(1e-8)
+    degree_norm = valency / valency.max().clamp_min(1.0)
+    x = torch.cat(
+        [
+            coordinates_norm,
+            applied_load / load_scale,
+            free_mask.float().unsqueeze(-1),
+            degree_norm.unsqueeze(-1),
+        ],
+        dim=-1,
     )
-    return graph
+    return x, length_scale, load_scale
 
 
-class AxialForceDataset(InMemoryDataset):
-    """PyTorch Geometric in-memory dataset."""
+class _TrussJsonDataset(InMemoryDataset):
+    node_feature_names: tuple[str, ...] = ()
+    edge_feature_names: tuple[str, ...] = ()
+    target_names: tuple[str, ...] = ()
+    process_version = 1
 
     def __init__(
         self,
         root: str | Path = "data",
-        cache_name: str = "trusses_v1",
-        typologies: Sequence[str] | None = None,
-        max_seeds_per_panel: int | None = None,
-        max_designs_per_seed: int | None = None,
+        *,
+        typologies: Optional[Sequence[str]] = None,
+        panels: Optional[Sequence[int]] = None,
+        max_seeds_per_panel: Optional[int] = None,
+        max_designs_per_seed: Optional[int] = None,
         sampling_seed: int = 42,
+        plane: str = "xz",
+        cache_name: str,
+        download_if_missing: bool = True,
         transform=None,
         pre_transform=None,
         pre_filter=None,
         force_reload: bool = False,
     ) -> None:
-        self.selected_typologies = (
-            tuple(sorted(str(name) for name in typologies)) if typologies is not None else None
+        self.typologies = (
+            tuple(sorted(_canonical_typology(name) for name in typologies))
+            if typologies
+            else None
         )
-        self.max_seeds_per_panel = max_seeds_per_panel
-        self.max_designs_per_seed = max_designs_per_seed
+        self.panels = tuple(sorted(int(panel) for panel in panels)) if panels else None
+        self.max_seeds_per_panel = _positive_or_none(
+            max_seeds_per_panel, "max_seeds_per_panel"
+        )
+        self.max_designs_per_seed = _positive_or_none(
+            max_designs_per_seed, "max_designs_per_seed"
+        )
         self.sampling_seed = int(sampling_seed)
+        self.plane = plane.lower()
+        if self.plane not in _PLANE_AXES:
+            raise ValueError(f"plane must be one of {sorted(_PLANE_AXES)}")
+        self.download_if_missing = bool(download_if_missing)
 
-        for name, value in (
-            ("max_seeds_per_panel", max_seeds_per_panel),
-            ("max_designs_per_seed", max_designs_per_seed),
-        ):
-            if value is not None and value < 1:
-                raise ValueError(f"{name} must be >= 1 or None")
-
-        selection = {
-            "typologies": self.selected_typologies,
+        self._config = {
+            "class": self.__class__.__name__,
+            "process_version": self.process_version,
+            "typologies": self.typologies,
+            "panels": self.panels,
             "max_seeds_per_panel": self.max_seeds_per_panel,
             "max_designs_per_seed": self.max_designs_per_seed,
             "sampling_seed": self.sampling_seed,
+            "plane": self.plane,
         }
-        signature = hashlib.sha1(
-            json.dumps(selection, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:10]
-        self.cache_name = f"{cache_name}_{signature}"
+        digest = hashlib.sha1(
+            json.dumps(self._config, sort_keys=True, default=list).encode("utf-8")
+        ).hexdigest()[:12]
+        self._cache_name = f"{cache_name}_{digest}.pt"
+        self._metadata_name = f"{cache_name}_{digest}.json"
 
         super().__init__(
             root=str(root),
@@ -232,192 +362,267 @@ class AxialForceDataset(InMemoryDataset):
             pre_filter=pre_filter,
             force_reload=force_reload,
         )
-        with open(self.processed_paths[0], "rb") as handle:
-            payload = pickle.load(handle)
-        self.data = payload["data"]
-        self.slices = payload["slices"]
-        self.metadata = payload["metadata"]
+        self._load_processed(self.processed_paths[0])
 
     @property
     def raw_file_names(self) -> List[str]:
-        return []
+        return list(self.typologies or [])
 
     @property
     def processed_file_names(self) -> List[str]:
-        return [f"{self.cache_name}.pkl"]
+        return [self._cache_name]
+
+    @property
+    def metadata_path(self) -> Path:
+        return Path(self.processed_dir) / self._metadata_name
 
     def download(self) -> None:
-        # Local dataset: nothing to download for now.
-        return None
-
-    def _select_json_paths(self, raw_root: Path) -> List[Path]:
-        """Select seed folders and designs before opening any JSON files.
-
-        Sampling is balanced per ``(typology, panel_count)``: for every panel
-        count, at most ``max_seeds_per_panel`` seed folders are selected, and
-        from each selected folder at most ``max_designs_per_seed`` designs are
-        selected. The selection is deterministic for ``sampling_seed``.
-        """
-        typology_dirs = sorted(path for path in raw_root.iterdir() if path.is_dir())
-        if self.selected_typologies is not None:
-            allowed = set(self.selected_typologies)
-            typology_dirs = [path for path in typology_dirs if path.name in allowed]
-
-        selected: List[Path] = []
-        for typology_dir in typology_dirs:
-            by_panel: Dict[int, List[Path]] = defaultdict(list)
-            for seed_dir in sorted(path for path in typology_dir.iterdir() if path.is_dir()):
-                match = _PANEL_SEED_RE.match(seed_dir.name)
-                if match is None:
-                    continue
-                by_panel[int(match.group("panels"))].append(seed_dir)
-
-            for panels, seed_dirs in sorted(by_panel.items()):
-                seed_dirs = sorted(seed_dirs)
-                if self.max_seeds_per_panel is not None:
-                    rng = random.Random(
-                        f"{self.sampling_seed}:{typology_dir.name}:panels_{panels}"
-                    )
-                    count = min(self.max_seeds_per_panel, len(seed_dirs))
-                    seed_dirs = sorted(rng.sample(seed_dirs, count))
-
-                for seed_dir in seed_dirs:
-                    graph_paths = sorted(seed_dir.glob("*.json"))
-                    if self.max_designs_per_seed is not None:
-                        rng = random.Random(
-                            f"{self.sampling_seed}:{typology_dir.name}:{seed_dir.name}"
-                        )
-                        count = min(self.max_designs_per_seed, len(graph_paths))
-                        graph_paths = sorted(rng.sample(graph_paths, count))
-                    selected.extend(graph_paths)
-
-        return sorted(selected)
+        if self.typologies is None:
+            return
+        raw_root = Path(self.raw_dir)
+        raw_root.mkdir(parents=True, exist_ok=True)
+        missing = [name for name in self.typologies if not (raw_root / name).is_dir()]
+        if missing and not self.download_if_missing:
+            raise FileNotFoundError(
+                "Missing selected typology folders: "
+                + ", ".join(str(raw_root / name) for name in missing)
+            )
+        for typology in missing:
+            _download_typology(raw_root, typology)
 
     def process(self) -> None:
         raw_root = Path(self.raw_dir)
-        json_paths = self._select_json_paths(raw_root)
-        if not json_paths:
+        selected = _select_json_paths(
+            raw_root,
+            typologies=self.typologies,
+            panels=self.panels,
+            max_seeds_per_panel=self.max_seeds_per_panel,
+            max_designs_per_seed=self.max_designs_per_seed,
+            sampling_seed=self.sampling_seed,
+        )
+        if not selected:
             raise FileNotFoundError(
-                f"No selected JSON files found below {raw_root}. Check the typology and sampling filters."
+                f"No matching JSON files found below {raw_root}. "
+                "Check typologies, panels, and folder layout."
             )
 
-        typologies = []
-        group_keys: List[str] = []
-        for path in json_paths:
-            relative = path.relative_to(raw_root)
-            typology = relative.parts[0] if len(relative.parts) > 1 else "unknown"
-            typologies.append(typology)
-            panels, seed = _parse_panels_seed(path, {})
-            if panels < 0 or seed < 0:
-                with path.open("r", encoding="utf-8") as handle:
-                    header = json.load(handle)
-                panels, seed = _parse_panels_seed(path, header)
-            group_keys.append(f"{typology}/panels_{panels}/seed_{seed}")
-
-        typologies = sorted(typologies)
-        typology_to_id = {name: idx for idx, name in enumerate(typologies)}
-        group_to_id = {name: idx for idx, name in enumerate(sorted(set(group_keys)))}
-
+        typology_names = sorted({item[1] for item in selected})
+        typology_to_id = {name: idx for idx, name in enumerate(typology_names)}
+        group_to_id: Dict[Tuple[str, int, int], int] = {}
         data_list: List[Data] = []
-        for path in json_paths:
-            graph = json_to_pyg_data(path, raw_root, typology_to_id, group_to_id)
-            if self.pre_filter is not None and not self.pre_filter(graph):
-                continue
-            if self.pre_transform is not None:
-                graph = self.pre_transform(graph)
-            data_list.append(graph)
+        skipped: List[dict[str, str]] = []
+
+        for index, (path, typology, panel_count, seed) in enumerate(selected):
+            group_key = (typology, panel_count, seed)
+            group_id = group_to_id.setdefault(group_key, len(group_to_id))
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    raw = json.load(handle)
+                common = _parse_common_graph(raw, self.plane)
+                graph = self.build_data(
+                    common,
+                    typology_id=typology_to_id[typology],
+                    panels=panel_count,
+                    seed=seed,
+                    group_id=group_id,
+                )
+                if self.pre_filter is not None and not self.pre_filter(graph):
+                    continue
+                if self.pre_transform is not None:
+                    graph = self.pre_transform(graph)
+                data_list.append(graph)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                skipped.append({"path": str(path), "error": str(exc)})
+
+            if (index + 1) % 5_000 == 0:
+                print(f"Processed {index + 1:,}/{len(selected):,} JSON files")
+
+        if not data_list:
+            raise RuntimeError("All selected JSON files failed conversion.")
 
         data, slices = self.collate(data_list)
-        metadata = {
-            "num_graphs": len(data_list),
-            "num_raw_files": len(json_paths),
-            "selection": {
-                "typologies": self.selected_typologies,
-                "max_seeds_per_panel": self.max_seeds_per_panel,
-                "max_designs_per_seed": self.max_designs_per_seed,
-                "sampling_seed": self.sampling_seed,
-            },
-            "typologies": typologies,
+        self.metadata = {
+            "config": self._config,
+            "num_selected_files": len(selected),
+            "num_processed_graphs": len(data_list),
+            "num_skipped_files": len(skipped),
+            "typologies": typology_names,
             "typology_to_id": typology_to_id,
-            "group_to_id": group_to_id,
-            "node_features": [
-                "x_over_span",
-                "z_over_span",
-                "applied_fx_over_load_scale",
-                "applied_fz_over_load_scale",
-                "support_flag",
-                "normalized_degree",
-            ],
-            "directed_edge_features": ["dx_over_span", "dz_over_span", "length_over_span"],
-            "member_features": ["length_over_span", "abs_cos_theta", "abs_sin_theta"],
-            "target": "axial_force_over_total_applied_load_magnitude",
-            "static_action": "sum(abs(axial_force) * member_length)",
+            "num_groups": len(group_to_id),
+            "node_feature_names": self.node_feature_names,
+            "edge_feature_names": self.edge_feature_names,
+            "member_feature_names": getattr(self, "member_feature_names", ()),
+            "target_names": self.target_names,
+            "skipped_examples": skipped[:20],
         }
         Path(self.processed_dir).mkdir(parents=True, exist_ok=True)
-        with open(self.processed_paths[0], "wb") as handle:
-            pickle.dump(
-                {"data": data, "slices": slices, "metadata": metadata},
-                handle,
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
+        torch.save((data, slices, self.metadata), self.processed_paths[0])
+        self.metadata_path.write_text(
+            json.dumps(self.metadata, indent=2), encoding="utf-8"
+        )
+
+    def _load_processed(self, path: str) -> None:
+        try:
+            payload = torch.load(path, weights_only=False)
+        except TypeError:
+            payload = torch.load(path)
+        self.data, self.slices, self.metadata = payload
+
+    def build_data(
+        self,
+        common: dict[str, Tensor | int],
+        *,
+        typology_id: int,
+        panels: int,
+        seed: int,
+        group_id: int,
+    ) -> Data:
+        raise NotImplementedError
 
 
-def random_split_indices(
-    num_graphs: int,
-    train_fraction: float = 0.8,
-    val_fraction: float = 0.1,
-    seed: int = 42,
-) -> Tuple[List[int], List[int], List[int]]:
-    if not 0.0 < train_fraction < 1.0:
-        raise ValueError("train_fraction must be in (0, 1)")
-    if not 0.0 <= val_fraction < 1.0:
-        raise ValueError("val_fraction must be in [0, 1)")
-    if train_fraction + val_fraction >= 1.0:
-        raise ValueError("train_fraction + val_fraction must be < 1")
+class AxialForceDataset(_TrussJsonDataset):
+    """Edge-level axial-force dataset."""
 
-    if num_graphs < 3:
-        raise ValueError("At least three graphs are required for train/validation/test splitting")
+    node_feature_names = (
+        "coord_1_norm",
+        "coord_2_norm",
+        "load_1_norm",
+        "load_2_norm",
+        "is_free",
+        "degree_norm",
+    )
+    edge_feature_names = ("delta_coord_1_norm", "delta_coord_2_norm", "length_norm")
+    member_feature_names = ("length_norm", "cos2", "sin2", "cos_sin")
+    target_names = ("axial_force_over_total_applied_load_magnitude",)
+    process_version = 4
 
-    indices = list(range(num_graphs))
-    random.Random(seed).shuffle(indices)
-    n_train = max(1, min(int(round(train_fraction * num_graphs)), num_graphs - 2))
-    n_val = max(1, min(int(round(val_fraction * num_graphs)), num_graphs - n_train - 1))
-    return indices[:n_train], indices[n_train : n_train + n_val], indices[n_train + n_val :]
+    def __init__(self, *args, cache_name: str = "truss_axial_force", **kwargs) -> None:
+        super().__init__(*args, cache_name=cache_name, **kwargs)
+
+    def build_data(
+        self,
+        common: dict[str, Tensor | int],
+        *,
+        typology_id: int,
+        panels: int,
+        seed: int,
+        group_id: int,
+    ) -> Data:
+        coordinates = common["coordinates"]
+        member_index = common["member_index"]
+        member_length = common["member_length"]
+        axial_force = common["axial_force"]
+        x, length_scale, load_scale = _node_inputs(common)
+
+        start, end = member_index
+        delta = coordinates[end] - coordinates[start]
+        delta_norm = delta / length_scale
+        length_norm = (member_length / length_scale).unsqueeze(-1)
+        forward_attr = torch.cat([delta_norm, length_norm], dim=-1)
+        reverse_attr = forward_attr.clone()
+        reverse_attr[:, :2] *= -1.0
+        edge_index = torch.cat([member_index, member_index.flip(0)], dim=1)
+        edge_attr = torch.cat([forward_attr, reverse_attr], dim=0)
+
+        direction = delta / member_length.clamp_min(1e-8).unsqueeze(-1)
+        member_attr = torch.cat(
+            [
+                length_norm,
+                direction[:, :1] ** 2,
+                direction[:, 1:2] ** 2,
+                direction[:, :1] * direction[:, 1:2],
+            ],
+            dim=-1,
+        )
+
+        return Data(
+            x=x,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            member_index=member_index,
+            member_attr=member_attr,
+            y=axial_force / load_scale,
+            axial_force=axial_force,
+            member_length=member_length,
+            load_scale=load_scale.view(1),
+            static_action=_static_action(axial_force, member_length).view(1),
+            pos_raw=coordinates,
+            typology_id=torch.tensor([typology_id], dtype=torch.long),
+            panels=torch.tensor([panels], dtype=torch.long),
+            seed=torch.tensor([seed], dtype=torch.long),
+            group_id=torch.tensor([group_id], dtype=torch.long),
+            graph_id=torch.tensor([common["graph_id"]], dtype=torch.long),
+            num_members=torch.tensor([common["num_members"]], dtype=torch.long),
+        )
 
 
-def grouped_split_indices(
-    dataset: TrussDataset,
-    train_fraction: float = 0.8,
-    val_fraction: float = 0.1,
-    seed: int = 42,
-) -> Tuple[List[int], List[int], List[int]]:
-    """Split complete typology/panel/seed groups to reduce near-duplicate leakage.
+class StaticActionDataset(AxialForceDataset):
+    """Graph-level static action evaluated from predicted member forces."""
 
-    Falls back to a graph-random split when fewer than three distinct groups
-    are present.
-    """
-    groups: Dict[int, List[int]] = defaultdict(list)
-    for idx in range(len(dataset)):
-        group_id = int(dataset.get(idx).group_id.item())
-        groups[group_id].append(idx)
 
-    if len(groups) < 3:
-        return random_split_indices(len(dataset), train_fraction, val_fraction, seed)
+class TrussDisplacementDataset(_TrussJsonDataset):
+    """Node-level in-plane displacement dataset."""
 
-    group_ids = list(groups)
-    random.Random(seed).shuffle(group_ids)
-    n_groups = len(group_ids)
-    n_train = max(1, int(round(train_fraction * n_groups)))
-    n_val = max(1, int(round(val_fraction * n_groups)))
-    if n_train + n_val >= n_groups:
-        n_train = max(1, n_groups - 2)
-        n_val = 1
+    node_feature_names = (
+        "coord_1_norm",
+        "coord_2_norm",
+        "load_1_norm",
+        "load_2_norm",
+        "is_free",
+        "degree_norm",
+    )
+    edge_feature_names = ("delta_coord_1_norm", "delta_coord_2_norm")
+    target_names = ("disp_1_norm", "disp_2_norm")
+    process_version = 4
 
-    train_groups = set(group_ids[:n_train])
-    val_groups = set(group_ids[n_train : n_train + n_val])
-    test_groups = set(group_ids[n_train + n_val :])
+    def __init__(
+        self,
+        root: str | Path = "data",
+        *,
+        families: Optional[Sequence[str]] = None,
+        typologies: Optional[Sequence[str]] = None,
+        cache_name: str = "truss_displacement",
+        **kwargs,
+    ) -> None:
+        if families is not None and typologies is not None:
+            raise ValueError("Use either families or typologies, not both.")
+        selected = typologies if typologies is not None else families
+        super().__init__(root=root, typologies=selected, cache_name=cache_name, **kwargs)
 
-    train_idx = [i for gid in train_groups for i in groups[gid]]
-    val_idx = [i for gid in val_groups for i in groups[gid]]
-    test_idx = [i for gid in test_groups for i in groups[gid]]
-    return train_idx, val_idx, test_idx
+    def build_data(
+        self,
+        common: dict[str, Tensor | int],
+        *,
+        typology_id: int,
+        panels: int,
+        seed: int,
+        group_id: int,
+    ) -> Data:
+        coordinates = common["coordinates"]
+        member_index = common["member_index"]
+        displacement = common["displacement"]
+        x, length_scale, force_scale = _node_inputs(common)
+        displacement_scale = (force_scale * length_scale).clamp_min(1e-8)
+
+        start, end = member_index
+        delta_norm = (coordinates[end] - coordinates[start]) / length_scale
+        edge_index = torch.cat([member_index, member_index.flip(0)], dim=1)
+        edge_attr = torch.cat([delta_norm, -delta_norm], dim=0).to(torch.float32)
+
+        return Data(
+            x=x,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            y=displacement / displacement_scale,
+            free_mask=common["free_mask"],
+            displacement=displacement,
+            displacement_scale=displacement_scale.view(1),
+            member_index=member_index,
+            pos_raw=coordinates,
+            typology_id=torch.tensor([typology_id], dtype=torch.long),
+            panels=torch.tensor([panels], dtype=torch.long),
+            seed=torch.tensor([seed], dtype=torch.long),
+            group_id=torch.tensor([group_id], dtype=torch.long),
+            graph_id=torch.tensor([common["graph_id"]], dtype=torch.long),
+            num_members=torch.tensor([common["num_members"]], dtype=torch.long),
+        )

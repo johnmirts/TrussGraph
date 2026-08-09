@@ -1,3 +1,5 @@
+"""GNN models used by the truss notebooks."""
+
 from __future__ import annotations
 
 from typing import Dict
@@ -5,7 +7,8 @@ from typing import Dict
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
-from torch_geometric.nn import MessagePassing
+from torch_geometric.data import Data
+from torch_geometric.nn import GINEConv, MessagePassing
 
 
 class MLP(nn.Module):
@@ -62,13 +65,13 @@ class TrussMessageBlock(MessagePassing):
 
 
 class TrussAxialForceGNN(nn.Module):
-    """Edge-level GNN surrogate for axial forces prediction."""
+    """Edge-level GNN surrogate for axial-force prediction."""
 
     def __init__(
         self,
         node_dim: int = 6,
         directed_edge_dim: int = 3,
-        member_dim: int = 3,
+        member_dim: int = 4,
         hidden_dim: int = 128,
         num_layers: int = 6,
         dropout: float = 0.05,
@@ -106,20 +109,13 @@ class TrussAxialForceGNN(nn.Module):
         h_start = h[start]
         h_end = h[end]
         member_embedding = self.member_encoder(data.member_attr)
-
-        # Symmetric endpoint representation: invariant to start/end ordering.
         pair_embedding = torch.cat(
             [h_start + h_end, torch.abs(h_start - h_end), member_embedding], dim=-1
         )
         axial_norm = self.member_decoder(pair_embedding).squeeze(-1)
-
         member_batch = self._member_batch(data)
-        output = {
-            "axial_norm": axial_norm,
-            "member_batch": member_batch,
-        }
+        output = {"axial_norm": axial_norm, "member_batch": member_batch}
 
-        # Physical forces and static action are not needed by the training loss.
         if compute_static_action:
             graph_load_scale = data.load_scale.view(-1)
             axial_force = axial_norm * graph_load_scale[member_batch]
@@ -134,3 +130,57 @@ class TrussAxialForceGNN(nn.Module):
             output["static_action"] = static_action
 
         return output
+
+
+class TrussDisplacementGNN(nn.Module):
+    """Residual GINE network with exact zero displacement at fixed nodes."""
+
+    def __init__(
+        self,
+        node_dim: int = 6,
+        edge_dim: int = 2,
+        hidden_dim: int = 64,
+        num_layers: int = 4,
+        dropout: float = 0.1,
+        out_dim: int = 2,
+    ) -> None:
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError("num_layers must be at least one")
+
+        self.node_encoder = nn.Sequential(
+            nn.Linear(node_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.convolutions = nn.ModuleList()
+        self.normalizations = nn.ModuleList()
+        for _ in range(num_layers):
+            update_mlp = nn.Sequential(
+                nn.Linear(hidden_dim, 2 * hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(2 * hidden_dim, hidden_dim),
+            )
+            self.convolutions.append(
+                GINEConv(update_mlp, edge_dim=edge_dim, train_eps=True)
+            )
+            self.normalizations.append(nn.LayerNorm(hidden_dim))
+
+        self.dropout = nn.Dropout(dropout)
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, data: Data) -> Tensor:
+        h = self.node_encoder(data.x)
+        for convolution, normalization in zip(self.convolutions, self.normalizations):
+            update = convolution(h, data.edge_index, data.edge_attr)
+            h = normalization(h + self.dropout(update))
+
+        displacement_norm = self.decoder(h)
+        return displacement_norm * data.free_mask.unsqueeze(-1).to(
+            displacement_norm.dtype
+        )
