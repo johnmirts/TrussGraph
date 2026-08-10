@@ -78,10 +78,10 @@ def random_split(
 ) -> DatasetSplit:
     if not 0.0 < train_fraction < 1.0:
         raise ValueError("train_fraction must be in (0, 1)")
-    if not 0.0 <= val_fraction < 1.0:
-        raise ValueError("val_fraction must be in [0, 1)")
-    if train_fraction + val_fraction >= 1.0:
-        raise ValueError("train_fraction + val_fraction must be < 1")
+    if not 0.0 <= validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be in [0, 1)")
+    if train_fraction + validation_fraction >= 1.0:
+        raise ValueError("train_fraction + validation_fraction must be < 1")
 
     num_graphs = len(dataset)
     if num_graphs < 3:
@@ -90,7 +90,7 @@ def random_split(
     indices = list(range(num_graphs))
     random.Random(seed).shuffle(indices)
     n_train = max(1, min(int(round(train_fraction * num_graphs)), num_graphs - 2))
-    n_val = max(1, min(int(round(val_fraction * num_graphs)), num_graphs - n_train - 1))
+    n_val = max(1, min(int(round(validation_fraction * num_graphs)), num_graphs - n_train - 1))
 
     return DatasetSplit(
         train=indices[:n_train], 
@@ -357,7 +357,6 @@ def collect_displacement_predictions(
         free = batch.free_mask
         node_true.append(target[free].cpu().numpy())
         node_pred.append(prediction[free].cpu().numpy())
-        node_panel.append(batch.panels[batch.batch[free]].cpu().numpy())
 
         for graph_index in range(batch.num_graphs):
             mask = (batch.batch == graph_index) & free

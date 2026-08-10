@@ -145,6 +145,7 @@ def _select_json_paths(
     *,
     typologies: Optional[Sequence[str]],
     panels: Optional[Sequence[int]],
+    seeds: Optional[Sequence[int]],
     max_seeds_per_panel: Optional[int],
     max_designs_per_seed: Optional[int],
     sampling_seed: int,
@@ -172,6 +173,8 @@ def _select_json_paths(
             panel_count = int(match.group("panels"))
             seed = int(match.group("seed"))
             if panels is not None and panel_count not in panels:
+                continue
+            if seeds is not None and seed not in seeds:
                 continue
             seed_groups[(typology, panel_count)].append((directory, seed))
 
@@ -310,6 +313,7 @@ class _TrussJsonDataset(InMemoryDataset):
         *,
         typologies: Optional[Sequence[str]] = None,
         panels: Optional[Sequence[int]] = None,
+        seeds: Optional[Sequence[int]] = None,
         max_seeds_per_panel: Optional[int] = None,
         max_designs_per_seed: Optional[int] = None,
         sampling_seed: int = 42,
@@ -327,6 +331,7 @@ class _TrussJsonDataset(InMemoryDataset):
             else None
         )
         self.panels = tuple(sorted(int(panel) for panel in panels)) if panels else None
+        self.seeds = tuple(sorted(int(seed) for seed in seeds)) if seeds else None
         self.max_seeds_per_panel = _positive_or_none(
             max_seeds_per_panel, "max_seeds_per_panel"
         )
@@ -344,6 +349,7 @@ class _TrussJsonDataset(InMemoryDataset):
             "process_version": self.process_version,
             "typologies": self.typologies,
             "panels": self.panels,
+            "seeds": self.seeds,
             "max_seeds_per_panel": self.max_seeds_per_panel,
             "max_designs_per_seed": self.max_designs_per_seed,
             "sampling_seed": self.sampling_seed,
@@ -396,6 +402,7 @@ class _TrussJsonDataset(InMemoryDataset):
             raw_root,
             typologies=self.typologies,
             panels=self.panels,
+            seeds=self.seeds,
             max_seeds_per_panel=self.max_seeds_per_panel,
             max_designs_per_seed=self.max_designs_per_seed,
             sampling_seed=self.sampling_seed,
@@ -478,6 +485,78 @@ class _TrussJsonDataset(InMemoryDataset):
         group_id: int,
     ) -> Data:
         raise NotImplementedError
+
+
+class TrussBaseDataset(_TrussJsonDataset):
+    """Lean dataset for importing and manipulating raw truss results.
+
+    Node features:
+    ``valency, is_free, coord_1, coord_2, force_1, force_2, disp_1, disp_2``.
+
+    Member features:
+    ``length, axial_force``.
+    """
+
+    node_feature_names = (
+        "valency",
+        "is_free",
+        "coord_1",
+        "coord_2",
+        "force_1",
+        "force_2",
+        "disp_1",
+        "disp_2",
+    )
+    edge_feature_names = ("length", "axial_force")
+    member_feature_names = ("length", "axial_force")
+    target_names: tuple[str, ...] = ()
+    process_version = 1
+
+    def __init__(self, *args, cache_name: str = "truss_base", **kwargs) -> None:
+        super().__init__(*args, cache_name=cache_name, **kwargs)
+
+    def build_data(
+        self,
+        common: dict[str, Tensor | int],
+        *,
+        typology_id: int,
+        panels: int,
+        seed: int,
+        group_id: int,
+    ) -> Data:
+        valency = common["valency"]
+        free_mask = common["free_mask"]
+        coordinates = common["coordinates"]
+        applied_load = common["applied_load"]
+        displacement = common["displacement"]
+        member_index = common["member_index"]
+        member_attr = torch.stack(
+            [common["member_length"], common["axial_force"]],
+            dim=-1,
+        )
+
+        return Data(
+            x=torch.cat(
+                [
+                    valency.unsqueeze(-1),
+                    free_mask.float().unsqueeze(-1),
+                    coordinates,
+                    applied_load,
+                    displacement,
+                ],
+                dim=-1,
+            ),
+            edge_index=torch.cat([member_index, member_index.flip(0)], dim=1),
+            edge_attr=torch.cat([member_attr, member_attr], dim=0),
+            member_index=member_index,
+            member_attr=member_attr,
+            typology_id=torch.tensor([typology_id], dtype=torch.long),
+            panels=torch.tensor([panels], dtype=torch.long),
+            seed=torch.tensor([seed], dtype=torch.long),
+            group_id=torch.tensor([group_id], dtype=torch.long),
+            graph_id=torch.tensor([common["graph_id"]], dtype=torch.long),
+            num_members=torch.tensor([common["num_members"]], dtype=torch.long),
+        )
 
 
 class AxialForceDataset(_TrussJsonDataset):
